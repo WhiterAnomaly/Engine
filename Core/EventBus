@@ -1,0 +1,355 @@
+/**
+ * NERVE ENGINE
+ * core/EventBus.js
+ *
+ * Sistema de eventos central da engine.
+ * Desacopla completamente os sistemas entre si —
+ * nenhum módulo precisa conhecer outro, só os eventos.
+ *
+ * Suporta:
+ *  - Listeners simples (on/off)
+ *  - Listeners de uso único (once)
+ *  - Prioridade de execução
+ *  - Eventos com namespace  (ex: 'scene:enter', 'choice:made')
+ *  - Wildcard listeners     (ex: 'scene:*')
+ *  - Fila assíncrona        (emit vs emitAsync)
+ *  - Interceptadores (middleware) antes do dispatch
+ *  - Histórico de eventos   (útil para debug e rollback)
+ *  - Eventos ocultos        (hidden — jogo usa, jogador não vê)
+ *
+ * NÃO conhece nenhum jogo específico.
+ * O jogo registra seus próprios eventos usando register().
+ *
+ * @author Claude (Nerve Engine Team)
+ * @version 0.1.0
+ */
+
+export class EventBus {
+  /**
+   * @param {Object}  options
+   * @param {boolean} [options.history=false]      - Guardar histórico de eventos
+   * @param {number}  [options.historyLimit=200]   - Máximo de eventos no histórico
+   * @param {boolean} [options.debug=false]        - Log de todos os eventos no console
+   */
+  constructor({ history = false, historyLimit = 200, debug = false } = {}) {
+    this._debug        = debug;
+    this._historyOn    = history;
+    this._historyLimit = historyLimit;
+
+    // Map<eventName, Array<Listener>>
+    // Listener: { id, fn, priority, once, hidden }
+    this._listeners = new Map();
+
+    // Middlewares: fn(eventName, payload) => payload | false
+    // false = cancela o evento
+    this._middlewares = [];
+
+    // Histórico: Array<{ event, payload, timestamp, hidden }>
+    this._history = [];
+
+    // Schemas de eventos registrados pelo jogo
+    // Map<eventName, { description, hidden, schema }>
+    this._registry = new Map();
+
+    this._idCounter = 0;
+  }
+
+  // ─────────────────────────────────────────────
+  // REGISTRO DE SCHEMAS (opcional mas recomendado)
+  // ─────────────────────────────────────────────
+
+  /**
+   * Registra a definição de um evento.
+   * Não é obrigatório para usar o bus, mas documenta o contrato
+   * e permite validação opcional.
+   *
+   * @param {string}  eventName
+   * @param {Object}  options
+   * @param {string}  [options.description]  - Descrição do evento
+   * @param {boolean} [options.hidden=false] - Evento oculto ao jogador (para mecânicas silenciosas)
+   * @param {Object}  [options.schema]       - Shape esperado do payload (para validação)
+   *
+   * @example
+   * bus.register('choice:made', {
+   *   description: 'Jogador fez uma escolha',
+   *   schema: { choiceId: 'string', timestamp: 'number', data: 'object' }
+   * })
+   *
+   * bus.register('flag:changed', {
+   *   hidden: true,
+   *   description: 'Flag interna alterada — jogador não vê'
+   * })
+   */
+  register(eventName, options = {}) {
+    this._registry.set(eventName, {
+      description: options.description ?? '',
+      hidden:      options.hidden      ?? false,
+      schema:      options.schema      ?? null,
+    });
+    return this;
+  }
+
+  /** Retorna todos os eventos registrados (para documentação/debug). */
+  getRegistry() {
+    return Object.fromEntries(this._registry);
+  }
+
+  // ─────────────────────────────────────────────
+  // SUBSCRIBE
+  // ─────────────────────────────────────────────
+
+  /**
+   * Inscreve um listener em um evento.
+   * Suporta wildcard: 'scene:*' escuta qualquer 'scene:xxx'.
+   *
+   * @param {string}   eventName          - Nome do evento ou padrão wildcard
+   * @param {Function} fn                 - Callback: fn(payload, meta) => void
+   * @param {Object}   [options]
+   * @param {number}   [options.priority=0] - Menor = executa primeiro
+   * @param {boolean}  [options.once=false] - Remove após primeiro disparo
+   * @returns {string} id do listener (usar para remover depois)
+   *
+   * @example
+   * const id = bus.on('choice:made', ({ choiceId }) => console.log(choiceId))
+   * bus.on('scene:*', (payload) => console.log('qualquer evento de cena'))
+   */
+  on(eventName, fn, { priority = 0, once = false } = {}) {
+    if (!this._listeners.has(eventName)) {
+      this._listeners.set(eventName, []);
+    }
+
+    const id = `listener_${++this._idCounter}`;
+    const listeners = this._listeners.get(eventName);
+
+    listeners.push({ id, fn, priority, once });
+    listeners.sort((a, b) => a.priority - b.priority);
+
+    return id;
+  }
+
+  /**
+   * Inscreve um listener que dispara apenas uma vez.
+   * @param {string}   eventName
+   * @param {Function} fn
+   * @param {Object}   [options]
+   * @returns {string} id do listener
+   */
+  once(eventName, fn, options = {}) {
+    return this.on(eventName, fn, { ...options, once: true });
+  }
+
+  /**
+   * Remove um listener pelo id retornado em on().
+   * @param {string} id
+   */
+  off(id) {
+    for (const [eventName, listeners] of this._listeners) {
+      const idx = listeners.findIndex(l => l.id === id);
+      if (idx !== -1) {
+        listeners.splice(idx, 1);
+        if (listeners.length === 0) this._listeners.delete(eventName);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Remove todos os listeners de um evento.
+   * @param {string} eventName
+   */
+  offAll(eventName) {
+    this._listeners.delete(eventName);
+    return this;
+  }
+
+  // ─────────────────────────────────────────────
+  // EMIT
+  // ─────────────────────────────────────────────
+
+  /**
+   * Dispara um evento de forma síncrona.
+   * Passa por middlewares antes de chegar aos listeners.
+   *
+   * @param {string} eventName
+   * @param {*}      [payload={}]
+   * @returns {boolean} false se algum middleware cancelou o evento
+   *
+   * @example
+   * bus.emit('choice:made', { choiceId: 'opt_a', timestamp: Date.now() })
+   */
+  emit(eventName, payload = {}) {
+    // Passa pelos middlewares
+    let current = payload;
+    for (const mw of this._middlewares) {
+      const result = mw(eventName, current);
+      if (result === false) {
+        if (this._debug) console.log(`[EventBus] ⛔ '${eventName}' cancelado por middleware`);
+        return false;
+      }
+      if (result !== undefined) current = result;
+    }
+
+    const meta = {
+      event:     eventName,
+      timestamp: performance.now(),
+      hidden:    this._registry.get(eventName)?.hidden ?? false,
+    };
+
+    if (this._debug && !meta.hidden) {
+      console.log(`[EventBus] 📡 '${eventName}'`, current);
+    }
+
+    // Salva no histórico
+    if (this._historyOn) {
+      this._history.push({ ...meta, payload: current });
+      if (this._history.length > this._historyLimit) {
+        this._history.shift();
+      }
+    }
+
+    // Dispara listeners exatos
+    this._dispatch(eventName, current, meta);
+
+    // Dispara listeners wildcard
+    const ns = eventName.split(':')[0];
+    if (ns) this._dispatch(`${ns}:*`, current, meta);
+
+    // Dispara listeners globais
+    this._dispatch('*', current, meta);
+
+    return true;
+  }
+
+  /**
+   * Dispara um evento de forma assíncrona (próximo microtask).
+   * Útil para evitar chamadas reentrantes.
+   *
+   * @param {string} eventName
+   * @param {*}      [payload={}]
+   * @returns {Promise<boolean>}
+   */
+  emitAsync(eventName, payload = {}) {
+    return Promise.resolve().then(() => this.emit(eventName, payload));
+  }
+
+  // ─────────────────────────────────────────────
+  // MIDDLEWARE
+  // ─────────────────────────────────────────────
+
+  /**
+   * Adiciona um interceptador que roda antes de qualquer listener.
+   * Pode modificar o payload ou cancelar o evento (retornando false).
+   *
+   * @param {Function} fn - fn(eventName, payload) => payload | false | void
+   *
+   * @example
+   * // Bloqueia eventos enquanto a engine está pausada
+   * bus.use((event, payload) => {
+   *   if (engine.state === 'paused' && event.startsWith('input:')) return false
+   * })
+   */
+  use(fn) {
+    this._middlewares.push(fn);
+    return this;
+  }
+
+  // ─────────────────────────────────────────────
+  // HISTÓRICO
+  // ─────────────────────────────────────────────
+
+  /**
+   * Retorna o histórico de eventos.
+   * @param {Object}  [options]
+   * @param {boolean} [options.includeHidden=false] - Incluir eventos ocultos
+   * @param {string}  [options.filter]              - Filtrar por nome de evento
+   */
+  getHistory({ includeHidden = false, filter } = {}) {
+    let history = this._history;
+    if (!includeHidden) history = history.filter(e => !e.hidden);
+    if (filter)         history = history.filter(e => e.event.startsWith(filter));
+    return [...history];
+  }
+
+  /** Limpa o histórico. */
+  clearHistory() {
+    this._history = [];
+    return this;
+  }
+
+  // ─────────────────────────────────────────────
+  // UTILITÁRIOS
+  // ─────────────────────────────────────────────
+
+  /**
+   * Retorna uma Promise que resolve quando o evento for disparado.
+   * Útil para lógica async baseada em eventos.
+   *
+   * @param {string} eventName
+   * @param {number} [timeout=0] - ms antes de rejeitar. 0 = sem timeout.
+   * @returns {Promise<{payload, meta}>}
+   *
+   * @example
+   * const { payload } = await bus.waitFor('scene:ready')
+   */
+  waitFor(eventName, timeout = 0) {
+    return new Promise((resolve, reject) => {
+      let timer;
+
+      const id = this.once(eventName, (payload, meta) => {
+        if (timer) clearTimeout(timer);
+        resolve({ payload, meta });
+      });
+
+      if (timeout > 0) {
+        timer = setTimeout(() => {
+          this.off(id);
+          reject(new Error(`[EventBus] waitFor('${eventName}') timeout após ${timeout}ms`));
+        }, timeout);
+      }
+    });
+  }
+
+  /**
+   * Retorna quantos listeners estão registrados.
+   * @param {string} [eventName] - Se omitido, retorna total geral
+   */
+  listenerCount(eventName) {
+    if (eventName) return this._listeners.get(eventName)?.length ?? 0;
+    let total = 0;
+    for (const arr of this._listeners.values()) total += arr.length;
+    return total;
+  }
+
+  /** Remove todos os listeners e limpa o estado. */
+  destroy() {
+    this._listeners.clear();
+    this._middlewares = [];
+    this._history     = [];
+    return this;
+  }
+
+  // ─────────────────────────────────────────────
+  // INTERNO
+  // ─────────────────────────────────────────────
+
+  _dispatch(eventName, payload, meta) {
+    const listeners = this._listeners.get(eventName);
+    if (!listeners || listeners.length === 0) return;
+
+    // Cópia para evitar mutação durante iteração
+    const snapshot = [...listeners];
+    const toRemove = [];
+
+    for (const listener of snapshot) {
+      try {
+        listener.fn(payload, meta);
+      } catch (err) {
+        console.error(`[EventBus] Erro no listener '${listener.id}' (${eventName}):`, err);
+      }
+      if (listener.once) toRemove.push(listener.id);
+    }
+
+    for (const id of toRemove) this.off(id);
+  }
+}
